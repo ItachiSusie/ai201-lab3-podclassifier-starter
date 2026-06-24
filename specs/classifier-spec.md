@@ -91,10 +91,21 @@ the format below:" followed by the output format you chose.
 **What output format should you request from the LLM?**
 
 ```
-[blank — you need to parse the response in classify_episode(). What format
-makes parsing reliable? Think about: a single label on its own line?
-A structured format like "Label: X / Reasoning: Y"? JSON?
-What are the tradeoffs?]
+Use a structured key-value format on two separate lines:
+
+  Label: <label>
+  Reasoning: <one or two sentences>
+
+Tradeoff analysis:
+- JSON is machine-readable but LLMs often wrap it in markdown fences
+  (```json ... ```) requiring extra stripping and json.loads() error handling.
+- Label-on-its-own-line is simplest to parse but the LLM sometimes adds a
+  preamble sentence before the label, breaking a naive "first line" approach.
+- "Label: X / Reasoning: Y" (chosen): easy to scan all lines for one that
+  starts with "label:", split on ":", take the value. Robust to extra lines
+  before or after. Normalize with .lower().strip() to handle capitalization
+  variance (e.g., "Label: Interview" → "interview") and strip markdown
+  punctuation like ** or `` to handle bold/code formatting.
 ```
 
 ---
@@ -102,8 +113,16 @@ What are the tradeoffs?]
 **Edge cases to handle in the prompt:**
 
 ```
-[blank — what if labeled_examples is empty? What if the description is very
-short? How does your prompt handle these?]
+1. labeled_examples is empty: the prompt still sends the task instruction and
+   the new episode — the LLM falls back to zero-shot classification using the
+   label definitions in the instruction block. Include the full label definitions
+   in the instruction so the model has enough context even without examples.
+
+2. Very short description (< ~20 characters): include it as-is. The LLM handles
+   short inputs and will lean on the label definitions. No special handling needed.
+
+3. Description contains special characters or newlines: Python f-strings handle
+   these naturally; no escaping required for a plain-text prompt.
 ```
 
 ---
@@ -159,9 +178,22 @@ Extract the response text from:
 **Step 3 — Parse the response:**
 
 ```
-[blank — how do you extract the label and reasoning from the LLM's text output?
-What string operations or parsing logic do you need?
-This depends on the output format you chose in build_few_shot_prompt.]
+Scan every line of the response for lines that start with "label:" and
+"reasoning:" (case-insensitive). Split each matched line on the first ":"
+and take the right-hand side. Strip whitespace and markdown punctuation
+(*, _, `) from the extracted label before validation.
+
+  label = "unknown"
+  reasoning = response_text.strip()
+  for line in response_text.strip().split("\n"):
+      clean = line.strip()
+      if clean.lower().startswith("label:"):
+          label = clean.split(":", 1)[1].strip().lower().strip("*_` ")
+      elif clean.lower().startswith("reasoning:"):
+          reasoning = clean.split(":", 1)[1].strip()
+
+Scanning all lines (not just the first) makes parsing robust to preamble
+sentences the LLM sometimes inserts before the structured output.
 ```
 
 ---
@@ -169,8 +201,14 @@ This depends on the output format you chose in build_few_shot_prompt.]
 **Step 4 — Validate the label:**
 
 ```
-[blank — what do you do if the LLM returns a label that isn't in VALID_LABELS?
-What should label be set to?]
+After parsing, check whether the extracted label is in VALID_LABELS
+(["interview", "solo", "panel", "narrative"]). If it is not — because the
+LLM returned an unrecognized string, left the field blank, or the label line
+was never found — set label to "unknown". Never pass an unvalidated string
+back to the caller.
+
+  if label not in VALID_LABELS:
+      label = "unknown"
 ```
 
 ---
@@ -178,9 +216,17 @@ What should label be set to?]
 **Step 5 — Handle errors gracefully:**
 
 ```
-[blank — what could go wrong? (Network error? Unparseable response?)
-What should the function return if something fails?
-Hint: the evaluation loop runs 20 calls — one bad response shouldn't crash everything.]
+Wrap the entire function body in a try/except Exception block. Possible
+failures include: network timeout, Groq API rate-limit error, empty response,
+or an unparseable response that slips past the parsing logic.
+
+On any exception, return a safe fallback dict so the evaluation loop
+(which calls this function 20 times) can continue without crashing:
+
+  except Exception as e:
+      return {"label": "unknown", "reasoning": f"Error during classification: {e}"}
+
+This guarantees that one bad API call never aborts the entire evaluation run.
 ```
 
 ---
